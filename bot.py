@@ -1,15 +1,37 @@
+import os
 import time
 import warnings
+from threading import Thread
+
+# Silenciar mensajes informativos y advertencias de TensorFlow
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+warnings.filterwarnings("ignore")
+
+from flask import Flask
 import numpy as np
 import pandas as pd
 import requests
 from scipy.stats import poisson
 import telebot
-from tensorflow.keras.layers import LSTM, Dense, Dropout, Input
+from tensorflow.keras.layers import Dense, Dropout, Input, LSTM
 from tensorflow.keras.models import Model
 from xgboost import XGBClassifier
 
-warnings.filterwarnings("ignore")
+# ==========================================
+# SERVIDOR FLASK OPTIMIZADO PARA RENDER
+# ==========================================
+app = Flask("")
+
+
+@app.route("/")
+def home():
+    return "🤖 Bot de Predicciones de Fútbol Activo 24/7", 200
+
+
+def run_flask():
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
+
 
 # ==========================================
 # CONFIGURACIÓN DE CREDENCIALES Y DICCIONARIOS
@@ -174,7 +196,7 @@ def calcular_probabilidades_poisson(lambda_home, lambda_away, max_goles=6):
 # MODELADO Y GENERACIÓN DE REPORTE
 # ==========================================
 def ejecutar_modelo_y_generar_reporte(league_code, max_jornadas=1):
-    """Ejecuta el pipeline completo de IA + Poisson (limite por defecto: 1 jornada)."""
+    """Ejecuta el pipeline completo de IA + Poisson."""
     df = get_historical_data_multiseason(league_code, SEASONS_TO_FETCH)
     if df.empty or "home" not in df.columns:
         return f"❌ No se pudieron extraer partidos históricos para la liga *{league_code}*."
@@ -358,5 +380,8 @@ def responder_prompt(message):
 
 
 if __name__ == "__main__":
+    # Iniciar servidor web Flask en segundo plano para que Render no cobre
+    Thread(target=run_flask).start()
+
     print("🤖 Bot de Telegram activo y esperando comandos...")
     bot.infinity_polling(timeout=10, long_polling_timeout=5)
