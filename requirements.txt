@@ -6,3 +6,4 @@ scipy
 xgboost
 tensorflow-cpu
 Flask
+flask
