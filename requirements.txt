@@ -1,0 +1,7 @@
+pyTelegramBotAPI
+requests
+pandas
+numpy
+scipy
+xgboost
+tensorflow-cpu
