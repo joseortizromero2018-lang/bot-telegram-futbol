@@ -5,3 +5,4 @@ numpy
 scipy
 xgboost
 tensorflow-cpu
+flask
