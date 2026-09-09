@@ -43,7 +43,6 @@ bot = telebot.TeleBot(TELEGRAM_TOKEN)
 HEADERS = {"X-Auth-Token": API_KEY}
 SEASONS_TO_FETCH = [2023, 2024, 2025, 2026]
 
-# Diccionario completo con las descripciones de las ligas
 LIGAS_DISPONIBLES = {
     "CL": "Champions League",
     "PD": "Primera División (España)",
@@ -61,7 +60,7 @@ LIGAS_DISPONIBLES = {
 # FUNCIONES AUXILIARES
 # ==========================================
 def enviar_mensaje_largo(chat_id, texto, limite_caracteres=3800):
-    """Divide mensajes largos en partes para evitar el límite de 4090 caracteres de Telegram."""
+    """Divide mensajes largos para no exceder el límite de Telegram."""
     if len(texto) <= limite_caracteres:
         partes = [texto]
     else:
@@ -89,10 +88,62 @@ def enviar_mensaje_largo(chat_id, texto, limite_caracteres=3800):
 
 
 # ==========================================
-# FUNCIONES DE EXTRACCIÓN Y PROCESAMIENTO
+# CÁLCULOS DE CÓRNERS Y POISSON
+# ==========================================
+def get_team_corners_history(df, team_name, window=5):
+    """Obtiene el historial de córners o aplica promedios base del fútbol profesional."""
+    team_matches = df[
+        (df["home"] == team_name) | (df["away"] == team_name)
+    ].copy()
+    if len(team_matches) < window or "h_corners" not in df.columns:
+        return 5.0, 4.5
+
+    recent = team_matches.tail(window)
+    c_favor, c_contra = [], []
+    for _, row in recent.iterrows():
+        if row["home"] == team_name:
+            c_favor.append(row.get("h_corners", 5.0))
+            c_contra.append(row.get("a_corners", 4.5))
+        else:
+            c_favor.append(row.get("a_corners", 4.5))
+            c_contra.append(row.get("h_corners", 5.0))
+
+    return np.mean(c_favor), np.mean(c_contra)
+
+
+def calcular_probabilidades_corners(
+    lambda_corners, lineas=[7.5, 8.5, 9.5, 10.5, 11.5]
+):
+    """Calcula la probabilidad de superar las líneas de córners (+7.5 a +11.5) mediante Poisson."""
+    probs = {}
+    for linea in lineas:
+        k_max = int(np.floor(linea))
+        prob_under = sum(poisson.pmf(k, lambda_corners) for k in range(k_max + 1))
+        probs[f"+{linea}"] = (1 - prob_under) * 100
+    return probs
+
+
+def calcular_probabilidades_poisson(lambda_home, lambda_away, max_goles=6):
+    """Calcula probabilidades de resultado 1X2 para goles."""
+    prob_matrix = np.zeros((max_goles, max_goles))
+    for i in range(max_goles):
+        for j in range(max_goles):
+            prob_matrix[i, j] = poisson.pmf(i, lambda_home) * poisson.pmf(
+                j, lambda_away
+            )
+
+    p_home = np.sum(np.tril(prob_matrix, -1))
+    p_draw = np.sum(np.diag(prob_matrix))
+    p_away = np.sum(np.triu(prob_matrix, 1))
+
+    total = p_home + p_draw + p_away
+    return p_home / total, p_draw / total, p_away / total
+
+
+# ==========================================
+# PROCESAMIENTO DE DATOS HISTÓRICOS
 # ==========================================
 def get_historical_data_multiseason(league_code, seasons):
-    """Extrae datos de partidos terminados para las temporadas indicadas."""
     all_matches = []
     for s in seasons:
         url = f"https://api.football-data.org/v4/competitions/{league_code}/matches?season={s}&status=FINISHED"
@@ -123,7 +174,6 @@ def get_historical_data_multiseason(league_code, seasons):
 
 
 def get_team_history(df, team_name, window=5):
-    """Obtiene datos de los últimos N partidos de un equipo (Goles favor, Goles contra)."""
     team_matches = df[
         (df["home"] == team_name) | (df["away"] == team_name)
     ].copy()
@@ -142,30 +192,22 @@ def get_team_history(df, team_name, window=5):
 
 
 def prepare_engine(df, window=5):
-    """Prepara tensores secuenciales para LSTM y estáticos para XGBoost."""
-    X_seq = []
-    X_stat = []
-    y = []
-
+    X_seq, X_stat, y = [], [], []
     mean_h_g = df["h_g"].mean() if len(df) > 0 else 1.4
     mean_a_g = df["a_g"].mean() if len(df) > 0 else 1.1
 
     for i in range(window * 2, len(df)):
-        h_team = df.iloc[i]["home"]
-        a_team = df.iloc[i]["away"]
-
+        h_team, a_team = df.iloc[i]["home"], df.iloc[i]["away"]
         df_sub = df.iloc[:i]
 
         r_h = get_team_history(df_sub, h_team, window=window)
         r_a = get_team_history(df_sub, a_team, window=window)
 
         seq = np.hstack([r_h, r_a])
-
         h_gf, h_ga = np.mean(r_h[:, 0]), np.mean(r_h[:, 1])
         a_gf, a_ga = np.mean(r_a[:, 0]), np.mean(r_a[:, 1])
 
-        hg = df.iloc[i]["h_g"]
-        ag = df.iloc[i]["a_g"]
+        hg, ag = df.iloc[i]["h_g"], df.iloc[i]["a_g"]
         target = 0 if hg > ag else (1 if hg == ag else 2)
 
         X_seq.append(seq)
@@ -175,35 +217,19 @@ def prepare_engine(df, window=5):
     return np.array(X_seq), np.array(X_stat), np.array(y)
 
 
-def calcular_probabilidades_poisson(lambda_home, lambda_away, max_goles=6):
-    """Calcula probabilidades 1X2 con distribución de Poisson."""
-    prob_matrix = np.zeros((max_goles, max_goles))
-    for i in range(max_goles):
-        for j in range(max_goles):
-            prob_matrix[i, j] = poisson.pmf(i, lambda_home) * poisson.pmf(
-                j, lambda_away
-            )
-
-    p_home = np.sum(np.tril(prob_matrix, -1))
-    p_draw = np.sum(np.diag(prob_matrix))
-    p_away = np.sum(np.triu(prob_matrix, 1))
-
-    total = p_home + p_draw + p_away
-    return p_home / total, p_draw / total, p_away / total
-
-
 # ==========================================
-# MODELADO Y GENERACIÓN DE REPORTE
+# GENERACIÓN DE REPORTE CON CÓRNERS
 # ==========================================
 def ejecutar_modelo_y_generar_reporte(league_code, max_jornadas=1):
-    """Ejecuta el pipeline completo de IA + Poisson."""
     df = get_historical_data_multiseason(league_code, SEASONS_TO_FETCH)
     if df.empty or "home" not in df.columns:
-        return f"❌ No se pudieron extraer partidos históricos para la liga *{league_code}*."
+        return f"❌ No se pudieron extraer datos históricos para *{league_code}*."
 
     X_s, X_st, y_train = prepare_engine(df)
     if len(X_s) == 0:
-        return f"⚠️ No hay suficientes datos procesables para la liga *{league_code}*."
+        return (
+            f"⚠️ No hay suficientes datos procesables para *{league_code}*."
+        )
 
     # 1. Modelo LSTM
     inp = Input(shape=(5, 4))
@@ -234,11 +260,11 @@ def ejecutar_modelo_y_generar_reporte(league_code, max_jornadas=1):
         random_state=42,
     ).fit(X_final, y_train)
 
-    # 3. Próximos partidos
+    # 3. Consulta de Próximos Partidos
     url = f"https://api.football-data.org/v4/competitions/{league_code}/matches?status=SCHEDULED,IN_PLAY,PAUSED"
     res = requests.get(url, headers=HEADERS)
     if res.status_code != 200:
-        return f"⚠️ Error al consultar la API de partidos ({res.status_code})."
+        return f"⚠️ Error consultando partidos ({res.status_code})."
 
     proximos = res.json().get("matches", [])
     if not proximos:
@@ -262,7 +288,7 @@ def ejecutar_modelo_y_generar_reporte(league_code, max_jornadas=1):
             m for m in proximos if m.get("matchday") in matchdays[:max_jornadas]
         ]
 
-    # 4. Formatear salida
+    # 4. Formatear reporte con sección de Córners
     nombre_liga = LIGAS_DISPONIBLES.get(league_code, league_code)
     reporte = f"📊 *REPORTE ANALÍTICO PRO: {nombre_liga}*\n"
     reporte += "═" * 30 + "\n\n"
@@ -271,8 +297,7 @@ def ejecutar_modelo_y_generar_reporte(league_code, max_jornadas=1):
     mean_a_g = df["a_g"].mean() if len(df) > 0 else 1.1
 
     for m in proximos:
-        h_name = m["homeTeam"]["name"]
-        a_name = m["awayTeam"]["name"]
+        h_name, a_name = m["homeTeam"]["name"], m["awayTeam"]["name"]
         fecha = m["utcDate"][:10]
         estado_str = (
             "🔴 EN VIVO"
@@ -319,23 +344,36 @@ def ejecutar_modelo_y_generar_reporte(league_code, max_jornadas=1):
         )
         p_over25 = (1 - sum(poisson.pmf(i, total_xg) for i in range(3))) * 100
 
+        # Cálculo de Córners
+        c_h_favor, c_h_contra = get_team_corners_history(df, h_name)
+        c_a_favor, c_a_contra = get_team_corners_history(df, a_name)
+
+        exp_c_home = (c_h_favor + c_a_contra) / 2
+        exp_c_away = (c_a_favor + c_h_contra) / 2
+        total_exp_corners = exp_c_home + exp_c_away
+
+        probs_corners = calcular_probabilidades_corners(total_exp_corners)
+
+        # Construcción del mensaje
         reporte += f"{estado_str} | 📅 {fecha}\n"
         reporte += f"⚽ *{h_name} vs {a_name}*\n"
         reporte += f"🏆 Local: {p_h:.1%} | Empate: {p_e:.1%} | Visita: {p_v:.1%}\n"
         reporte += f"🥅 Goles Est.: {h_name}: {avg_h_xg:.2f} | {a_name}: {avg_a_xg:.2f}\n"
-        reporte += (
-            f"🔥 Both Score: {p_btts:.1f}% | Over 2.5: {p_over25:.1f}%\n"
-        )
+        reporte += f"🔥 Both Score: {p_btts:.1f}% | Over 2.5 Goles: {p_over25:.1f}%\n"
+        reporte += f"🚩 *Córners Estimados:* {h_name}: {exp_c_home:.1f} | {a_name}: {exp_c_away:.1f} (Total: {total_exp_corners:.1f})\n"
+        reporte += f"📈 *Probabilidades Córners:*\n"
+        reporte += f"   • +7.5: {probs_corners['+7.5']:.1f}% | +8.5: {probs_corners['+8.5']:.1f}%\n"
+        reporte += f"   • +9.5: {probs_corners['+9.5']:.1f}% | +10.5: {probs_corners['+10.5']:.1f}%\n"
+        reporte += f"   • +11.5: {probs_corners['+11.5']:.1f}%\n"
         reporte += "─────────────────────────────\n"
 
     return reporte
 
 
 # ==========================================
-# HANDLERS DEL BOT DE TELEGRAM
+# HANDLERS DEL BOT
 # ==========================================
 def obtener_menu_ligas():
-    """Genera el texto formateado con la lista de ligas disponibles."""
     menu = "⚽ *LIGAS DISPONIBLES EN EL BOT*\n\n"
     menu += "Envía el código de la liga para generar el análisis:\n\n"
     for codigo, nombre in LIGAS_DISPONIBLES.items():
@@ -380,7 +418,6 @@ def responder_prompt(message):
 
 
 if __name__ == "__main__":
-    # Iniciar servidor web Flask en segundo plano para que Render no cobre
     Thread(target=run_flask).start()
 
     print("🤖 Bot de Telegram activo y esperando comandos...")
