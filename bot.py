@@ -88,27 +88,44 @@ def enviar_mensaje_largo(chat_id, texto, limite_caracteres=3800):
 
 
 # ==========================================
-# CÁLCULOS DE CÓRNERS Y POISSON
+# CÁLCULOS DINÁMICOS DE CÓRNERS Y POISSON
 # ==========================================
-def get_team_corners_history(df, team_name, window=5):
-    """Obtiene el historial de córners o aplica promedios base del fútbol profesional."""
+def get_team_corners_history_estimated(
+    df, team_name, mean_league_gf, window=5
+):
+    """Estima los córners proyectados en función de la producción ofensiva y defensiva reciente."""
     team_matches = df[
         (df["home"] == team_name) | (df["away"] == team_name)
     ].copy()
-    if len(team_matches) < window or "h_corners" not in df.columns:
-        return 5.0, 4.5
+
+    if len(team_matches) < window:
+        return 4.8, 4.7
 
     recent = team_matches.tail(window)
-    c_favor, c_contra = [], []
+    gf_list, ga_list = [], []
+
     for _, row in recent.iterrows():
         if row["home"] == team_name:
-            c_favor.append(row.get("h_corners", 5.0))
-            c_contra.append(row.get("a_corners", 4.5))
+            gf_list.append(row["h_g"])
+            ga_list.append(row["a_g"])
         else:
-            c_favor.append(row.get("a_corners", 4.5))
-            c_contra.append(row.get("h_corners", 5.0))
+            gf_list.append(row["a_g"])
+            ga_list.append(row["h_g"])
 
-    return np.mean(c_favor), np.mean(c_contra)
+    avg_gf = np.mean(gf_list)
+    avg_ga = np.mean(ga_list)
+
+    ratio_ataque = (
+        (avg_gf / max(0.5, mean_league_gf)) if mean_league_gf > 0 else 1.0
+    )
+    ratio_defensa = (
+        (avg_ga / max(0.5, mean_league_gf)) if mean_league_gf > 0 else 1.0
+    )
+
+    c_favor_est = max(2.5, min(8.5, 4.75 * (0.6 * ratio_ataque + 0.4)))
+    c_contra_est = max(2.5, min(8.5, 4.5 * (0.6 * ratio_defensa + 0.4)))
+
+    return c_favor_est, c_contra_est
 
 
 def calcular_probabilidades_corners(
@@ -118,7 +135,9 @@ def calcular_probabilidades_corners(
     probs = {}
     for linea in lineas:
         k_max = int(np.floor(linea))
-        prob_under = sum(poisson.pmf(k, lambda_corners) for k in range(k_max + 1))
+        prob_under = sum(
+            poisson.pmf(k, lambda_corners) for k in range(k_max + 1)
+        )
         probs[f"+{linea}"] = (1 - prob_under) * 100
     return probs
 
@@ -218,7 +237,7 @@ def prepare_engine(df, window=5):
 
 
 # ==========================================
-# GENERACIÓN DE REPORTE CON CÓRNERS
+# GENERACIÓN DE REPORTE CON CÓRNERS DINÁMICOS
 # ==========================================
 def ejecutar_modelo_y_generar_reporte(league_code, max_jornadas=1):
     df = get_historical_data_multiseason(league_code, SEASONS_TO_FETCH)
@@ -288,7 +307,7 @@ def ejecutar_modelo_y_generar_reporte(league_code, max_jornadas=1):
             m for m in proximos if m.get("matchday") in matchdays[:max_jornadas]
         ]
 
-    # 4. Formatear reporte con sección de Córners
+    # 4. Formatear reporte con sección de Córners Adaptativos
     nombre_liga = LIGAS_DISPONIBLES.get(league_code, league_code)
     reporte = f"📊 *REPORTE ANALÍTICO PRO: {nombre_liga}*\n"
     reporte += "═" * 30 + "\n\n"
@@ -344,9 +363,13 @@ def ejecutar_modelo_y_generar_reporte(league_code, max_jornadas=1):
         )
         p_over25 = (1 - sum(poisson.pmf(i, total_xg) for i in range(3))) * 100
 
-        # Cálculo de Córners
-        c_h_favor, c_h_contra = get_team_corners_history(df, h_name)
-        c_a_favor, c_a_contra = get_team_corners_history(df, a_name)
+        # Cálculo de Córners dinámicos en base al volumen ofensivo
+        c_h_favor, c_h_contra = get_team_corners_history_estimated(
+            df, h_name, mean_h_g
+        )
+        c_a_favor, c_a_contra = get_team_corners_history_estimated(
+            df, a_name, mean_a_g
+        )
 
         exp_c_home = (c_h_favor + c_a_contra) / 2
         exp_c_away = (c_a_favor + c_h_contra) / 2
@@ -387,7 +410,9 @@ def enviar_bienvenida(message):
         "🤖 *Bot de Predicción Predictiva de Fútbol*\n"
         "Combinación de Deep Learning (LSTM), XGBoost y Distribución de Poisson.\n\n"
     )
-    bot.reply_to(message, bienvenida + obtener_menu_ligas(), parse_mode="Markdown")
+    bot.reply_to(
+        message, bienvenida + obtener_menu_ligas(), parse_mode="Markdown"
+    )
 
 
 @bot.message_handler(func=lambda msg: True)
@@ -402,7 +427,9 @@ def responder_prompt(message):
             parse_mode="Markdown",
         )
         try:
-            resultado = ejecutar_modelo_y_generar_reporte(texto, max_jornadas=1)
+            resultado = ejecutar_modelo_y_generar_reporte(
+                texto, max_jornadas=1
+            )
             enviar_mensaje_largo(message.chat.id, resultado)
 
         except Exception as e:
