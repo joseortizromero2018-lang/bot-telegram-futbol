@@ -3,7 +3,7 @@ requests
 pandas
 numpy
 scipy
+scikit-learn
 xgboost
 tensorflow-cpu
-Flask
 flask
