@@ -39,6 +39,8 @@ def run_flask():
 API_KEY = "40f348e5bd5646daa606c0096cb13fb2"
 TELEGRAM_TOKEN = "8847776327:AAFfy6zP0uS1EwrXbgeR2WlJTNLul7gd50Q"
 
+bot.delete_webhook()
+
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 HEADERS = {"X-Auth-Token": API_KEY}
 SEASONS_TO_FETCH = [2023, 2024, 2025, 2026]
