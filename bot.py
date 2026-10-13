@@ -1,6 +1,7 @@
 import os
 import time
 import warnings
+from datetime import datetime, timedelta, timezone
 from threading import Thread
 
 # Silenciar mensajes informativos y advertencias de TensorFlow
@@ -39,12 +40,10 @@ def run_flask():
 API_KEY = "40f348e5bd5646daa606c0096cb13fb2"
 TELEGRAM_TOKEN = "8708621550:AAHHS-YQaABZWILyQyudJ53FX8gOjNl7hBs"
 
-
-
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 HEADERS = {"X-Auth-Token": API_KEY}
 SEASONS_TO_FETCH = [2021, 2022, 2023, 2024, 2025, 2026]
-#bot.delete_webhook()
+
 LIGAS_DISPONIBLES = {
     "CL": "Champions League",
     "PD": "Primera División (España)",
@@ -239,9 +238,9 @@ def prepare_engine(df, window=5):
 
 
 # ==========================================
-# GENERACIÓN DE REPORTE CON CÓRNERS DINÁMICOS
+# GENERACIÓN DE REPORTE CON RANGO DE DÍAS Y CÓRNERS
 # ==========================================
-def ejecutar_modelo_y_generar_reporte(league_code, max_jornadas=1):
+def ejecutar_modelo_y_generar_reporte(league_code, dias_a_futuro=7):
     df = get_historical_data_multiseason(league_code, SEASONS_TO_FETCH)
     if df.empty or "home" not in df.columns:
         return f"❌ No se pudieron extraer datos históricos para *{league_code}*."
@@ -281,7 +280,7 @@ def ejecutar_modelo_y_generar_reporte(league_code, max_jornadas=1):
         random_state=42,
     ).fit(X_final, y_train)
 
-    # 3. Consulta de Próximos Partidos
+    # 3. Consulta de Próximos Partidos (Filtrado por ventana de tiempo/días)
     url = f"https://api.football-data.org/v4/competitions/{league_code}/matches?status=SCHEDULED,IN_PLAY,PAUSED"
     res = requests.get(url, headers=HEADERS)
     if res.status_code != 200:
@@ -294,22 +293,31 @@ def ejecutar_modelo_y_generar_reporte(league_code, max_jornadas=1):
             f"⚠️ No hay encuentros programados ni en vivo para *{nombre_liga}*."
         )
 
-    proximos = sorted(proximos, key=lambda x: x["utcDate"])
-    matchdays = sorted(
-        list(
-            set(
-                m.get("matchday")
-                for m in proximos
-                if m.get("matchday") is not None
-            )
-        )
-    )
-    if matchdays:
-        proximos = [
-            m for m in proximos if m.get("matchday") in matchdays[:max_jornadas]
-        ]
+    ahora = datetime.now(timezone.utc)
+    limite_fecha = ahora + timedelta(days=dias_a_futuro)
 
-    # 4. Formatear reporte con sección de Córners Adaptativos
+    partidos_filtrados = []
+    for m in proximos:
+        fecha_match = datetime.fromisoformat(
+            m["utcDate"].replace("Z", "+00:00")
+        )
+        if m.get("status") in ["IN_PLAY", "PAUSED"] or (
+            ahora <= fecha_match <= limite_fecha
+        ):
+            partidos_filtrados.append(m)
+
+    # Si no hay encuentros en la ventana de días, tomar los próximos 10 por fecha
+    if not partidos_filtrados:
+        proximos = sorted(proximos, key=lambda x: x["utcDate"])
+        partidos_filtrados = proximos[:10]
+    else:
+        partidos_filtrados = sorted(
+            partidos_filtrados, key=lambda x: x["utcDate"]
+        )
+
+    proximos = partidos_filtrados
+
+    # 4. Formatear reporte
     nombre_liga = LIGAS_DISPONIBLES.get(league_code, league_code)
     reporte = f"📊 *REPORTE ANALÍTICO PRO: {nombre_liga}*\n"
     reporte += "═" * 30 + "\n\n"
@@ -320,10 +328,11 @@ def ejecutar_modelo_y_generar_reporte(league_code, max_jornadas=1):
     for m in proximos:
         h_name, a_name = m["homeTeam"]["name"], m["awayTeam"]["name"]
         fecha = m["utcDate"][:10]
+        jornada = m.get("matchday", "N/A")
         estado_str = (
             "🔴 EN VIVO"
             if m.get("status") in ["IN_PLAY", "PAUSED"]
-            else "📅 PROGRAMADO"
+            else f"📅 JORNADA {jornada}"
         )
 
         r_h = get_team_history(df, h_name, window=5)
@@ -365,7 +374,7 @@ def ejecutar_modelo_y_generar_reporte(league_code, max_jornadas=1):
         )
         p_over25 = (1 - sum(poisson.pmf(i, total_xg) for i in range(3))) * 100
 
-        # Cálculo de Córners dinámicos en base al volumen ofensivo
+        # Cálculo de Córners dinámicos
         c_h_favor, c_h_contra = get_team_corners_history_estimated(
             df, h_name, mean_h_g
         )
@@ -379,7 +388,7 @@ def ejecutar_modelo_y_generar_reporte(league_code, max_jornadas=1):
 
         probs_corners = calcular_probabilidades_corners(total_exp_corners)
 
-        # Construcción del mensaje
+        # Mensaje del reporte
         reporte += f"{estado_str} | 📅 {fecha}\n"
         reporte += f"⚽ *{h_name} vs {a_name}*\n"
         reporte += f"🏆 Local: {p_h:.1%} | Empate: {p_e:.1%} | Visita: {p_v:.1%}\n"
@@ -387,9 +396,9 @@ def ejecutar_modelo_y_generar_reporte(league_code, max_jornadas=1):
         reporte += f"🔥 Both Score: {p_btts:.1f}% | Over 2.5 Goles: {p_over25:.1f}%\n"
         reporte += f"🚩 *Córners Estimados:* {h_name}: {exp_c_home:.1f} | {a_name}: {exp_c_away:.1f} (Total: {total_exp_corners:.1f})\n"
         reporte += f"📈 *Probabilidades Córners:*\n"
-        reporte += f"   • +7.5: {probs_corners['+7.5']:.1f}% | +8.5: {probs_corners['+8.5']:.1f}%\n"
-        reporte += f"   • +9.5: {probs_corners['+9.5']:.1f}% | +10.5: {probs_corners['+10.5']:.1f}%\n"
-        reporte += f"   • +11.5: {probs_corners['+11.5']:.1f}%\n"
+        reporte += f"    • +7.5: {probs_corners['+7.5']:.1f}% | +8.5: {probs_corners['+8.5']:.1f}%\n"
+        reporte += f"    • +9.5: {probs_corners['+9.5']:.1f}% | +10.5: {probs_corners['+10.5']:.1f}%\n"
+        reporte += f"    • +11.5: {probs_corners['+11.5']:.1f}%\n"
         reporte += "─────────────────────────────\n"
 
     return reporte
@@ -429,8 +438,9 @@ def responder_prompt(message):
             parse_mode="Markdown",
         )
         try:
+            # Se analizan los partidos de los próximos 7 días
             resultado = ejecutar_modelo_y_generar_reporte(
-                texto, max_jornadas=1
+                texto, dias_a_futuro=7
             )
             enviar_mensaje_largo(message.chat.id, resultado)
 
