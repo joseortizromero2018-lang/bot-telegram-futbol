@@ -9,13 +9,14 @@ os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 warnings.filterwarnings("ignore")
 
 from flask import Flask
+import joblib
 import numpy as np
 import pandas as pd
 import requests
 from scipy.stats import poisson
 import telebot
 from tensorflow.keras.layers import Dense, Dropout, Input, LSTM
-from tensorflow.keras.models import Model
+from tensorflow.keras.models import Model, load_model
 from xgboost import XGBClassifier
 
 # ==========================================
@@ -42,7 +43,12 @@ TELEGRAM_TOKEN = "8708621550:AAHHS-YQaABZWILyQyudJ53FX8gOjNl7hBs"
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 HEADERS = {"X-Auth-Token": API_KEY}
-SEASONS_TO_FETCH = [2021, 2022, 2023, 2024, 2025, 2026]
+SEASONS_PAST = [2021, 2022, 2023, 2024, 2025]
+CURRENT_SEASON = 2026
+
+# Sesión reutilizable para mayor velocidad
+session = requests.Session()
+session.headers.update(HEADERS)
 
 LIGAS_DISPONIBLES = {
     "CL": "Champions League",
@@ -89,12 +95,89 @@ def enviar_mensaje_largo(chat_id, texto, limite_caracteres=3800):
 
 
 # ==========================================
-# CÁLCULOS DINÁMICOS DE CÓRNERS Y POISSON
+# GESTIÓN DE DATOS Y CACHÉ LOCAL EN CSV
+# ==========================================
+def get_historical_data_cached(league_code):
+    """Carga temporadas pasadas desde CSV local (o descarga 1 vez) y concatena la temporada actual."""
+    csv_file = f"cache_{league_code}_historical.csv"
+    df_past = pd.DataFrame()
+
+    if os.path.exists(csv_file):
+        try:
+            df_past = pd.read_csv(csv_file)
+            df_past["utcDate"] = pd.to_datetime(df_past["utcDate"])
+        except Exception as e:
+            print(f"Error leyendo CSV local de {league_code}: {e}")
+
+    if df_past.empty:
+        past_matches = []
+        for s in SEASONS_PAST:
+            url = f"https://api.football-data.org/v4/competitions/{league_code}/matches?season={s}&status=FINISHED"
+            try:
+                res = session.get(url)
+                if res.status_code == 200:
+                    data = res.json().get("matches", [])
+                    for m in data:
+                        past_matches.append(
+                            {
+                                "season": s,
+                                "utcDate": m.get("utcDate"),
+                                "home": m["homeTeam"]["name"],
+                                "away": m["awayTeam"]["name"],
+                                "h_g": m["score"]["fullTime"]["home"],
+                                "a_g": m["score"]["fullTime"]["away"],
+                            }
+                        )
+                time.sleep(0.2)
+            except Exception as e:
+                print(f"Error descargando temporada {s}: {e}")
+
+        df_past = pd.DataFrame(past_matches)
+        if not df_past.empty:
+            df_past.to_csv(csv_file, index=False)
+            df_past["utcDate"] = pd.to_datetime(df_past["utcDate"])
+
+    # Descargar únicamente la temporada actual activa
+    current_matches = []
+    url_curr = f"https://api.football-data.org/v4/competitions/{league_code}/matches?season={CURRENT_SEASON}&status=FINISHED"
+    try:
+        res = session.get(url_curr)
+        if res.status_code == 200:
+            data = res.json().get("matches", [])
+            for m in data:
+                current_matches.append(
+                    {
+                        "season": CURRENT_SEASON,
+                        "utcDate": m.get("utcDate"),
+                        "home": m["homeTeam"]["name"],
+                        "away": m["awayTeam"]["name"],
+                        "h_g": m["score"]["fullTime"]["home"],
+                        "a_g": m["score"]["fullTime"]["away"],
+                    }
+                )
+    except Exception as e:
+        print(f"Error actualizando temporada actual {league_code}: {e}")
+
+    df_curr = pd.DataFrame(current_matches)
+    if not df_curr.empty:
+        df_curr["utcDate"] = pd.to_datetime(df_curr["utcDate"])
+        df_full = pd.concat([df_past, df_curr], ignore_index=True)
+    else:
+        df_full = df_past
+
+    if not df_full.empty:
+        df_full = df_full.sort_values("utcDate").reset_index(drop=True)
+
+    return df_full
+
+
+# ==========================================
+# CÁLCULOS ORIGINALES DE CÓRNERS Y POISSON
 # ==========================================
 def get_team_corners_history_estimated(
     df, team_name, mean_league_gf, window=5
 ):
-    """Estima los córners proyectados en función de la producción ofensiva y defensiva reciente."""
+    """Estima córners en función de producción ofensiva/defensiva reciente (Lógica Original)."""
     team_matches = df[
         (df["home"] == team_name) | (df["away"] == team_name)
     ].copy()
@@ -132,7 +215,6 @@ def get_team_corners_history_estimated(
 def calcular_probabilidades_corners(
     lambda_corners, lineas=[7.5, 8.5, 9.5, 10.5, 11.5]
 ):
-    """Calcula la probabilidad de superar las líneas de córners (+7.5 a +11.5) mediante Poisson."""
     probs = {}
     for linea in lineas:
         k_max = int(np.floor(linea))
@@ -144,7 +226,6 @@ def calcular_probabilidades_corners(
 
 
 def calcular_probabilidades_poisson(lambda_home, lambda_away, max_goles=6):
-    """Calcula probabilidades de resultado 1X2 para goles."""
     prob_matrix = np.zeros((max_goles, max_goles))
     for i in range(max_goles):
         for j in range(max_goles):
@@ -161,38 +242,8 @@ def calcular_probabilidades_poisson(lambda_home, lambda_away, max_goles=6):
 
 
 # ==========================================
-# PROCESAMIENTO DE DATOS HISTÓRICOS
+# PROCESAMIENTO DE HISTORIAL (ORIGINAL)
 # ==========================================
-def get_historical_data_multiseason(league_code, seasons):
-    all_matches = []
-    for s in seasons:
-        url = f"https://api.football-data.org/v4/competitions/{league_code}/matches?season={s}&status=FINISHED"
-        try:
-            res = requests.get(url, headers=HEADERS)
-            if res.status_code == 200:
-                data = res.json().get("matches", [])
-                for m in data:
-                    all_matches.append(
-                        {
-                            "season": s,
-                            "utcDate": m.get("utcDate"),
-                            "home": m["homeTeam"]["name"],
-                            "away": m["awayTeam"]["name"],
-                            "h_g": m["score"]["fullTime"]["home"],
-                            "a_g": m["score"]["fullTime"]["away"],
-                        }
-                    )
-            time.sleep(0.3)
-        except Exception as e:
-            print(f"Error extrayendo temporada {s}: {e}")
-
-    df = pd.DataFrame(all_matches)
-    if not df.empty:
-        df["utcDate"] = pd.to_datetime(df["utcDate"])
-        df = df.sort_values("utcDate").reset_index(drop=True)
-    return df
-
-
 def get_team_history(df, team_name, window=5):
     team_matches = df[
         (df["home"] == team_name) | (df["away"] == team_name)
@@ -238,10 +289,10 @@ def prepare_engine(df, window=5):
 
 
 # ==========================================
-# GENERACIÓN DE REPORTE CON RANGO DE DÍAS Y CÓRNERS
+# GENERACIÓN DE REPORTE Y PERSISTENCIA DE MODELOS
 # ==========================================
 def ejecutar_modelo_y_generar_reporte(league_code, dias_a_futuro=7):
-    df = get_historical_data_multiseason(league_code, SEASONS_TO_FETCH)
+    df = get_historical_data_cached(league_code)
     if df.empty or "home" not in df.columns:
         return f"❌ No se pudieron extraer datos históricos para *{league_code}*."
 
@@ -251,38 +302,51 @@ def ejecutar_modelo_y_generar_reporte(league_code, dias_a_futuro=7):
             f"⚠️ No hay suficientes datos procesables para *{league_code}*."
         )
 
-    # 1. Modelo LSTM
-    inp = Input(shape=(5, 4))
-    x = LSTM(32, return_sequences=False)(inp)
-    x = Dropout(0.2)(x)
-    fe = Dense(16, activation="relu")(x)
-    out = Dense(3, activation="softmax")(fe)
+    # Definir rutas de guardado de los modelos según la liga
+    keras_model_path = f"modelo_lstm_{league_code}.keras"
+    xgb_model_path = f"modelo_xgb_{league_code}.pkl"
 
-    model = Model(inputs=inp, outputs=out)
-    model.compile(
-        optimizer="adam",
-        loss="sparse_categorical_crossentropy",
-        metrics=["accuracy"],
-    )
-    model.fit(X_s, y_train, epochs=15, batch_size=16, verbose=0)
+    # 1. Cargar o Entrenar Modelo LSTM
+    if os.path.exists(keras_model_path):
+        model = load_model(keras_model_path)
+        extractor = Model(inputs=model.inputs, outputs=model.layers[2].output)
+    else:
+        inp = Input(shape=(5, 4))
+        x = LSTM(32, return_sequences=False)(inp)
+        x = Dropout(0.2)(x)
+        fe = Dense(16, activation="relu")(x)
+        out = Dense(3, activation="softmax")(fe)
 
-    # 2. Extractor de características + XGBoost
-    extractor = Model(inputs=inp, outputs=fe)
+        model = Model(inputs=inp, outputs=out)
+        model.compile(
+            optimizer="adam",
+            loss="sparse_categorical_crossentropy",
+            metrics=["accuracy"],
+        )
+        model.fit(X_s, y_train, epochs=15, batch_size=16, verbose=0)
+        model.save(keras_model_path)
+        extractor = Model(inputs=inp, outputs=fe)
+
+    # 2. Extractor + XGBoost Classifier (Cargar o Entrenar)
     extracted_features = extractor.predict(X_s, verbose=0)
     X_final = np.hstack([extracted_features, X_st])
 
-    xgb = XGBClassifier(
-        n_estimators=100,
-        learning_rate=0.03,
-        max_depth=3,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        random_state=42,
-    ).fit(X_final, y_train)
+    if os.path.exists(xgb_model_path):
+        xgb = joblib.load(xgb_model_path)
+    else:
+        xgb = XGBClassifier(
+            n_estimators=100,
+            learning_rate=0.03,
+            max_depth=3,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            random_state=42,
+        ).fit(X_final, y_train)
+        joblib.dump(xgb, xgb_model_path)
 
-    # 3. Consulta de Próximos Partidos (Filtrado por ventana de tiempo/días)
+    # 3. Consulta de Próximos Partidos (Ventana por rango de días)
     url = f"https://api.football-data.org/v4/competitions/{league_code}/matches?status=SCHEDULED,IN_PLAY,PAUSED"
-    res = requests.get(url, headers=HEADERS)
+    res = session.get(url)
     if res.status_code != 200:
         return f"⚠️ Error consultando partidos ({res.status_code})."
 
@@ -306,7 +370,6 @@ def ejecutar_modelo_y_generar_reporte(league_code, dias_a_futuro=7):
         ):
             partidos_filtrados.append(m)
 
-    # Si no hay encuentros en la ventana de días, tomar los próximos 10 por fecha
     if not partidos_filtrados:
         proximos = sorted(proximos, key=lambda x: x["utcDate"])
         partidos_filtrados = proximos[:10]
@@ -374,7 +437,18 @@ def ejecutar_modelo_y_generar_reporte(league_code, dias_a_futuro=7):
         )
         p_over25 = (1 - sum(poisson.pmf(i, total_xg) for i in range(3))) * 100
 
-        # Cálculo de Córners dinámicos
+        # Detección de Recomendación / Oportunidad por alto porcentaje
+        sugerencia = ""
+        if p_h >= 0.55:
+            sugerencia = f"💡 *RECOMENDACIÓN:* Victoria {h_name} ({p_h:.1%})"
+        elif p_v >= 0.55:
+            sugerencia = f"💡 *RECOMENDACIÓN:* Victoria {a_name} ({p_v:.1%})"
+        elif p_over25 >= 65.0:
+            sugerencia = (
+                f"💡 *RECOMENDACIÓN:* Alta probabilidad Over 2.5 ({p_over25:.1f}%)"
+            )
+
+        # Cálculo de Córners dinámicos (Fórmula Original)
         c_h_favor, c_h_contra = get_team_corners_history_estimated(
             df, h_name, mean_h_g
         )
@@ -388,12 +462,14 @@ def ejecutar_modelo_y_generar_reporte(league_code, dias_a_futuro=7):
 
         probs_corners = calcular_probabilidades_corners(total_exp_corners)
 
-        # Mensaje del reporte
+        # Construcción del mensaje
         reporte += f"{estado_str} | 📅 {fecha}\n"
         reporte += f"⚽ *{h_name} vs {a_name}*\n"
         reporte += f"🏆 Local: {p_h:.1%} | Empate: {p_e:.1%} | Visita: {p_v:.1%}\n"
         reporte += f"🥅 Goles Est.: {h_name}: {avg_h_xg:.2f} | {a_name}: {avg_a_xg:.2f}\n"
         reporte += f"🔥 Both Score: {p_btts:.1f}% | Over 2.5 Goles: {p_over25:.1f}%\n"
+        if sugerencia:
+            reporte += f"{sugerencia}\n"
         reporte += f"🚩 *Córners Estimados:* {h_name}: {exp_c_home:.1f} | {a_name}: {exp_c_away:.1f} (Total: {total_exp_corners:.1f})\n"
         reporte += f"📈 *Probabilidades Córners:*\n"
         reporte += f"    • +7.5: {probs_corners['+7.5']:.1f}% | +8.5: {probs_corners['+8.5']:.1f}%\n"
@@ -438,7 +514,6 @@ def responder_prompt(message):
             parse_mode="Markdown",
         )
         try:
-            # Se analizan los partidos de los próximos 7 días
             resultado = ejecutar_modelo_y_generar_reporte(
                 texto, dias_a_futuro=7
             )
