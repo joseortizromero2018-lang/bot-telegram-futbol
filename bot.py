@@ -39,7 +39,7 @@ def run_flask():
 # CONFIGURACIÓN DE CREDENCIALES Y DICCIONARIOS
 # ==========================================
 API_KEY = "40f348e5bd5646daa606c0096cb13fb2"
-TELEGRAM_TOKEN = "8708621550:AAF2r7soDbzFs0hATe9EzzBITsbP7CCyMEA"
+TELEGRAM_TOKEN = "8686243895:AAE5GsHVhBTN9DbEgIimtLa4XtMBkKMs5fw"
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 HEADERS = {"X-Auth-Token": API_KEY}
