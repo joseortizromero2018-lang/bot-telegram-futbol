@@ -37,13 +37,13 @@ def run_flask():
 # CONFIGURACIÓN DE CREDENCIALES Y DICCIONARIOS
 # ==========================================
 API_KEY = "40f348e5bd5646daa606c0096cb13fb2"
-TELEGRAM_TOKEN = "8708621550:AAHeoCgFchM7sB0PHuis2UyCMnGe02U0d5M"
+TELEGRAM_TOKEN = "8708621550:AAGcmMsJKylcaf_qyJgRUejVfQeTxSc2mSs"
 
 
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 HEADERS = {"X-Auth-Token": API_KEY}
-SEASONS_TO_FETCH = [2023, 2024, 2025, 2026]
+SEASONS_TO_FETCH = [2021, 2022, 2023, 2024, 2025, 2026]
 #bot.delete_webhook()
 LIGAS_DISPONIBLES = {
     "CL": "Champions League",
