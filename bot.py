@@ -37,7 +37,7 @@ def run_flask():
 # CONFIGURACIÓN DE CREDENCIALES Y DICCIONARIOS
 # ==========================================
 API_KEY = "40f348e5bd5646daa606c0096cb13fb2"
-TELEGRAM_TOKEN = "8708621550:AAGcmMsJKylcaf_qyJgRUejVfQeTxSc2mSs"
+TELEGRAM_TOKEN = "8708621550:AAHHS-YQaABZWILyQyudJ53FX8gOjNl7hBs"
 
 
 
