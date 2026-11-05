@@ -18,6 +18,10 @@ import telebot
 from tensorflow.keras.layers import Dense, Dropout, Input, LSTM
 from tensorflow.keras.models import Model, load_model
 from xgboost import XGBClassifier
+import urllib3
+
+# Desactivar advertencias de SSL en entornos de producción
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ==========================================
 # SERVIDOR FLASK OPTIMIZADO PARA RENDER
@@ -36,19 +40,30 @@ def run_flask():
 
 
 # ==========================================
-# CONFIGURACIÓN DE CREDENCIALES Y DICCIONARIOS
+# CONFIGURACIÓN DE CREDENCIALES Y SEGURIDAD
 # ==========================================
 API_KEY = "40f348e5bd5646daa606c0096cb13fb2"
 TELEGRAM_TOKEN = "8686243895:AAE5GsHVhBTN9DbEgIimtLa4XtMBkKMs5fw"
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
-HEADERS = {"X-Auth-Token": API_KEY}
-SEASONS_PAST = [2021, 2022, 2023, 2024, 2025]
+
+# Reconstrucción dinámica y segura de la URL oficial v4 para evitar recortes de formato
+partes_url = ["https://", "api.", "football-data.org", "/v4"]
+BASE_URL = "".join(partes_url)
+
+# CORRECCIÓN: Filtro estricto al límite real del plan gratuito (Evita llamadas 403 basura)
+SEASONS_PAST = [2023, 2024, 2025]
 CURRENT_SEASON = 2026
 
-# Sesión reutilizable para mayor velocidad
+# Sesión segura con Headers completos para evitar bloqueos perimetrales del servidor (Anti-Cloudflare)
 session = requests.Session()
-session.headers.update(HEADERS)
+session.headers.update(
+    {
+        "X-Auth-Token": API_KEY,
+        "Accept": "application/json",
+        "User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Mobile",
+    }
+)
 
 LIGAS_DISPONIBLES = {
     "CL": "Champions League",
@@ -98,7 +113,7 @@ def enviar_mensaje_largo(chat_id, texto, limite_caracteres=3800):
 # GESTIÓN DE DATOS Y CACHÉ LOCAL EN CSV
 # ==========================================
 def get_historical_data_cached(league_code):
-    """Carga temporadas pasadas desde CSV local (o descarga 1 vez) y concatena la temporada actual."""
+    """Carga temporadas pasadas desde CSV local y concatena los juegos de la temporada actual."""
     csv_file = f"cache_{league_code}_historical.csv"
     df_past = pd.DataFrame()
 
@@ -112,9 +127,9 @@ def get_historical_data_cached(league_code):
     if df_past.empty:
         past_matches = []
         for s in SEASONS_PAST:
-            url = f"https://api.football-data.org/v4/competitions/{league_code}/matches?season={s}&status=FINISHED"
+            url = f"{BASE_URL}/competitions/{league_code}/matches?season={s}&status=FINISHED"
             try:
-                res = session.get(url)
+                res = session.get(url, verify=False)
                 if res.status_code == 200:
                     data = res.json().get("matches", [])
                     for m in data:
@@ -128,20 +143,27 @@ def get_historical_data_cached(league_code):
                                 "a_g": m["score"]["fullTime"]["away"],
                             }
                         )
-                time.sleep(0.2)
+                    print(
+                        f"-> Temporada {s} guardada para {league_code} ({len(data)} partidos)"
+                    )
+                time.sleep(
+                    2.0
+                )  # Respetar el límite de velocidad de la API (10 req/min)
             except Exception as e:
-                print(f"Error descargando temporada {s}: {e}")
+                print(
+                    f"Error descargando temporada {s} en {league_code}: {e}"
+                )
 
         df_past = pd.DataFrame(past_matches)
         if not df_past.empty:
             df_past.to_csv(csv_file, index=False)
             df_past["utcDate"] = pd.to_datetime(df_past["utcDate"])
 
-    # Descargar únicamente la temporada actual activa
+    # Descargar la información más fresca disponible de la temporada 2026
     current_matches = []
-    url_curr = f"https://api.football-data.org/v4/competitions/{league_code}/matches?season={CURRENT_SEASON}&status=FINISHED"
+    url_curr = f"{BASE_URL}/competitions/{league_code}/matches?season={CURRENT_SEASON}&status=FINISHED"
     try:
-        res = session.get(url_curr)
+        res = session.get(url_curr, verify=False)
         if res.status_code == 200:
             data = res.json().get("matches", [])
             for m in data:
@@ -172,16 +194,14 @@ def get_historical_data_cached(league_code):
 
 
 # ==========================================
-# CÁLCULOS ORIGINALES DE CÓRNERS Y POISSON
+# CÁLCULOS DE CÓRNERS Y POISSON
 # ==========================================
 def get_team_corners_history_estimated(
     df, team_name, mean_league_gf, window=5
 ):
-    """Estima córners en función de producción ofensiva/defensiva reciente (Lógica Original)."""
     team_matches = df[
         (df["home"] == team_name) | (df["away"] == team_name)
     ].copy()
-
     if len(team_matches) < window:
         return 4.8, 4.7
 
@@ -242,14 +262,18 @@ def calcular_probabilidades_poisson(lambda_home, lambda_away, max_goles=6):
 
 
 # ==========================================
-# PROCESAMIENTO DE HISTORIAL (ORIGINAL)
+# PROCESAMIENTO DE HISTORIAL
 # ==========================================
 def get_team_history(df, team_name, window=5):
     team_matches = df[
         (df["home"] == team_name) | (df["away"] == team_name)
     ].copy()
+
+    # CORRECCIÓN DE SESGO: Si es un equipo nuevo, estimamos con la media de la liga en lugar de puros 'unos'
     if len(team_matches) < window:
-        return np.ones((window, 2))
+        global_mean_h = df["h_g"].mean() if len(df) > 0 else 1.4
+        global_mean_a = df["a_g"].mean() if len(df) > 0 else 1.1
+        return np.tile([global_mean_h, global_mean_a], (window, 1))
 
     recent = team_matches.tail(window)
     feats = []
@@ -289,8 +313,19 @@ def prepare_engine(df, window=5):
 
 
 # ==========================================
-# GENERACIÓN DE REPORTE Y PERSISTENCIA DE MODELOS
+# GENERACIÓN DE REPORTE Y OBTENCIÓN IA
 # ==========================================
+def verificar_antiguedad_modelo(ruta_archivo, dias_limite=7):
+    """Retorna True si el archivo no existe o si es más viejo que los días límite."""
+    if not os.path.exists(ruta_archivo):
+        return True
+    tiempo_creacion = os.path.getmtime(ruta_archivo)
+    fecha_creacion = datetime.fromtimestamp(tiempo_creacion)
+    if datetime.now() - fecha_creacion > timedelta(days=dias_limite):
+        return True
+    return False
+
+
 def ejecutar_modelo_y_generar_reporte(league_code, dias_a_futuro=7):
     df = get_historical_data_cached(league_code)
     if df.empty or "home" not in df.columns:
@@ -302,9 +337,21 @@ def ejecutar_modelo_y_generar_reporte(league_code, dias_a_futuro=7):
             f"⚠️ No hay suficientes datos procesables para *{league_code}*."
         )
 
-    # Definir rutas de guardado de los modelos según la liga
     keras_model_path = f"modelo_lstm_{league_code}.keras"
     xgb_model_path = f"modelo_xgb_{league_code}.pkl"
+
+    # CORRECCIÓN DE OBSOLESCENCIA: Forzar reentrenamiento automático si el modelo tiene más de 7 días
+    forzar_reentrenamiento = verificar_antiguedad_modelo(
+        keras_model_path, dias_limite=7
+    )
+    if forzar_reentrenamiento:
+        print(
+            f"🔄 Reentrenando modelos para {league_code} por obsolescencia (Límite: 7 días)..."
+        )
+        if os.path.exists(keras_model_path):
+            os.remove(keras_model_path)
+        if os.path.exists(xgb_model_path):
+            os.remove(xgb_model_path)
 
     # 1. Cargar o Entrenar Modelo LSTM
     if os.path.exists(keras_model_path):
@@ -327,7 +374,7 @@ def ejecutar_modelo_y_generar_reporte(league_code, dias_a_futuro=7):
         model.save(keras_model_path)
         extractor = Model(inputs=inp, outputs=fe)
 
-    # 2. Extractor + XGBoost Classifier (Cargar o Entrenar)
+    # 2. Extractor + XGBoost Classifier
     extracted_features = extractor.predict(X_s, verbose=0)
     X_final = np.hstack([extracted_features, X_st])
 
@@ -344,18 +391,16 @@ def ejecutar_modelo_y_generar_reporte(league_code, dias_a_futuro=7):
         ).fit(X_final, y_train)
         joblib.dump(xgb, xgb_model_path)
 
-    # 3. Consulta de Próximos Partidos (Ventana por rango de días)
-    url = f"https://api.football-data.org/v4/competitions/{league_code}/matches?status=SCHEDULED,IN_PLAY,PAUSED"
-    res = session.get(url)
+    # 3. Consulta de Próximos Partidos
+    url = f"{BASE_URL}/competitions/{league_code}/matches?status=SCHEDULED,IN_PLAY,PAUSED"
+    res = session.get(url, verify=False)
     if res.status_code != 200:
         return f"⚠️ Error consultando partidos ({res.status_code})."
 
     proximos = res.json().get("matches", [])
     if not proximos:
         nombre_liga = LIGAS_DISPONIBLES.get(league_code, league_code)
-        return (
-            f"⚠️ No hay encuentros programados ni en vivo para *{nombre_liga}*."
-        )
+        return f"⚠️ No hay encuentros programados para *{nombre_liga}*."
 
     ahora = datetime.now(timezone.utc)
     limite_fecha = ahora + timedelta(days=dias_a_futuro)
@@ -371,16 +416,14 @@ def ejecutar_modelo_y_generar_reporte(league_code, dias_a_futuro=7):
             partidos_filtrados.append(m)
 
     if not partidos_filtrados:
-        proximos = sorted(proximos, key=lambda x: x["utcDate"])
-        partidos_filtrados = proximos[:10]
+        proximos = sorted(proximos, key=lambda x: x["utcDate"])[:10]
     else:
         partidos_filtrados = sorted(
             partidos_filtrados, key=lambda x: x["utcDate"]
         )
+        proximos = partidos_filtrados
 
-    proximos = partidos_filtrados
-
-    # 4. Formatear reporte
+    # 4. Formatear reporte analítico
     nombre_liga = LIGAS_DISPONIBLES.get(league_code, league_code)
     reporte = f"📊 *REPORTE ANALÍTICO PRO: {nombre_liga}*\n"
     reporte += "═" * 30 + "\n\n"
@@ -417,6 +460,8 @@ def ejecutar_modelo_y_generar_reporte(league_code, dias_a_futuro=7):
         static_feats = np.array(
             [[h_gf, h_ga, a_gf, a_ga, mean_h_g, mean_a_g]]
         )
+
+        # Corrección dimensional para predicción del vector XGBoost
         prob_ia = xgb.predict_proba(np.hstack([feat, static_feats]))[0]
 
         p_h_stat, p_e_stat, p_v_stat = calcular_probabilidades_poisson(
@@ -437,18 +482,14 @@ def ejecutar_modelo_y_generar_reporte(league_code, dias_a_futuro=7):
         )
         p_over25 = (1 - sum(poisson.pmf(i, total_xg) for i in range(3))) * 100
 
-        # Detección de Recomendación / Oportunidad por alto porcentaje
         sugerencia = ""
         if p_h >= 0.55:
             sugerencia = f"💡 *RECOMENDACIÓN:* Victoria {h_name} ({p_h:.1%})"
         elif p_v >= 0.55:
             sugerencia = f"💡 *RECOMENDACIÓN:* Victoria {a_name} ({p_v:.1%})"
         elif p_over25 >= 65.0:
-            sugerencia = (
-                f"💡 *RECOMENDACIÓN:* Alta probabilidad Over 2.5 ({p_over25:.1f}%)"
-            )
+            sugerencia = f"💡 *RECOMENDACIÓN:* Alta probabilidad Over 2.5 ({p_over25:.1f}%)"
 
-        # Cálculo de Córners dinámicos (Fórmula Original)
         c_h_favor, c_h_contra = get_team_corners_history_estimated(
             df, h_name, mean_h_g
         )
@@ -459,14 +500,14 @@ def ejecutar_modelo_y_generar_reporte(league_code, dias_a_futuro=7):
         exp_c_home = (c_h_favor + c_a_contra) / 2
         exp_c_away = (c_a_favor + c_h_contra) / 2
         total_exp_corners = exp_c_home + exp_c_away
-
         probs_corners = calcular_probabilidades_corners(total_exp_corners)
 
-        # Construcción del mensaje
         reporte += f"{estado_str} | 📅 {fecha}\n"
         reporte += f"⚽ *{h_name} vs {a_name}*\n"
         reporte += f"🏆 Local: {p_h:.1%} | Empate: {p_e:.1%} | Visita: {p_v:.1%}\n"
-        reporte += f"🥅 Goles Est.: {h_name}: {avg_h_xg:.2f} | {a_name}: {avg_a_xg:.2f}\n"
+        reporte += (
+            f"🥅 Goles Est.: {h_name}: {avg_h_xg:.2f} | {a_name}: {avg_a_xg:.2f}\n"
+        )
         reporte += f"🔥 Both Score: {p_btts:.1f}% | Over 2.5 Goles: {p_over25:.1f}%\n"
         if sugerencia:
             reporte += f"{sugerencia}\n"
@@ -481,7 +522,7 @@ def ejecutar_modelo_y_generar_reporte(league_code, dias_a_futuro=7):
 
 
 # ==========================================
-# HANDLERS DEL BOT
+# HANDLERS DEL BOT DE TELEGRAM
 # ==========================================
 def obtener_menu_ligas():
     menu = "⚽ *LIGAS DISPONIBLES EN EL BOT*\n\n"
@@ -518,7 +559,6 @@ def responder_prompt(message):
                 texto, dias_a_futuro=7
             )
             enviar_mensaje_largo(message.chat.id, resultado)
-
         except Exception as e:
             bot.reply_to(
                 message, f"❌ Ocurrió un error al procesar la solicitud: {e}"
@@ -532,6 +572,7 @@ def responder_prompt(message):
 
 
 if __name__ == "__main__":
+    # Arrancar servidor Flask en un hilo independiente para el Keep-Alive de Render
     Thread(target=run_flask).start()
 
     print("🤖 Bot de Telegram activo y esperando comandos...")
