@@ -43,7 +43,7 @@ def run_flask():
 # CONFIGURACIÓN DE CREDENCIALES Y SEGURIDAD
 # ==========================================
 API_KEY = "40f348e5bd5646daa606c0096cb13fb2"
-TELEGRAM_TOKEN = "8686243895:AAE5GsHVhBTN9DbEgIimtLa4XtMBkKMs5fw"
+TELEGRAM_TOKEN = "9157614082:AAEuzLUkHrrMMHAmCM7Sp_hWXXRww_lE-EU"
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 
@@ -75,6 +75,7 @@ LIGAS_DISPONIBLES = {
     "DED": "Eredivisie (Países Bajos)",
     "PPL": "Primeira Liga (Portugal)",
     "ELC": "Championship (Inglaterra)",
+    "BSA": "Campeonato Brasileiro Série A (Brasil)"
 }
 
 
